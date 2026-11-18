@@ -96,10 +96,12 @@ interface CaseFile {
 interface Sample {
   /** Mean viewers at each hour of its release day, null where the source had no point. */
   profile: Array<number | null>;
-  /** Peak viewers across the hours just before its release day. */
-  prePeak: number;
-  /** log(viewers at the hours before the release day), oldest first. */
-  trail: number[];
+  /**
+   * Viewers at each of the hours just before its release day, oldest first, or null when the
+   * source has a gap there. Model A only needs the day itself, so a comparable with a gap is kept
+   * for the shape medians and skipped by model B alone.
+   */
+  trail: number[] | null;
   /** Model A's weight. */
   weight: number;
 }
@@ -178,25 +180,25 @@ function toSample(comp: Comparable, p1: number): Sample | null {
   if (present < MIN_SLOTS_PRESENT) return null;
 
   const trail: number[] = [];
+  let trailComplete = true;
   for (let slot = -TRAIL_HOURS; slot <= -1; slot++) {
     const value = before.get(slot);
-    if (value === undefined) return null;
+    if (value === undefined) { trailComplete = false; break; }
     trail.push(value);
   }
-  if (trail.length !== TRAIL_HOURS) return null;
 
   const year = new Date(comp.day_start).getUTCFullYear();
   const recency = Number.isFinite(year) ? Math.exp(-(REFERENCE_YEAR - year) / HALF_LIFE_YEARS) : 1;
   const level = Math.exp(-LEVEL_WEIGHT * Math.abs(Math.log(hour1) - Math.log(p1)));
-  return { profile, prePeak: Math.max(...trail), trail, weight: recency * level };
+  return {
+    profile,
+    trail: trailComplete && trail.length === TRAIL_HOURS ? trail : null,
+    weight: recency * level,
+  };
 }
 
 /** Model A: weighted median shape and weighted MAD spread. */
-function shapeModel(
-  samples: Sample[],
-  p1: number,
-  hour: number,
-): { centre: number; spread: number; rows: number } {
+function shapeModel(samples: Sample[], hour: number): { centre: number; spread: number } {
   const slot = hour - 1;
   const observations: Array<[number, number]> = [];
   for (const sample of samples) {
@@ -209,11 +211,11 @@ function shapeModel(
     observations.push([logged - baseLog, sample.weight]);
   }
   if (observations.length < 3) {
-    return { centre: FALLBACK_SHAPE[hour - 2], spread: 0.35, rows: observations.length };
+    return { centre: FALLBACK_SHAPE[hour - 2], spread: 0.35 };
   }
   const centre = weightedMedian(observations);
   const spread = Math.max(SIGMA_FLOOR, SIGMA_SCALE * 1.4826 * weightedMad(observations, centre));
-  return { centre, spread, rows: observations.length };
+  return { centre, spread };
 }
 
 /** Standardise a log trajectory to zero mean and unit spread, so shapes compare. */
@@ -256,10 +258,12 @@ function levelModel(samples: Sample[], targetTrail: number[], p1: number): Map<n
 
   const rows: Array<{ b: number; r: Map<number, number>; w: number }> = [];
   for (const sample of samples) {
-    const base = logOf(sample.profile[0]);
-    const peak = sample.prePeak;
+    const hour1 = sample.profile[0];
+    if (hour1 === null || hour1 < MIN_LEVEL_HOUR1) continue;
+    if (sample.trail === null) continue;
+    const peak = Math.max(...sample.trail);
+    const base = logOf(hour1);
     if (base === null || !(peak > 0)) continue;
-    if (sample.profile[0] === null || sample.profile[0] < MIN_LEVEL_HOUR1) continue;
 
     const r = new Map<number, number>();
     for (let hour = FIRST_HOUR; hour <= LAST_HOUR; hour++) {
@@ -275,6 +279,16 @@ function levelModel(samples: Sample[], targetTrail: number[], p1: number): Map<n
     rows.push({ b: base - Math.log(peak), r, w: Math.exp(-distance / (2 * BANDWIDTH)) });
   }
   if (rows.length < MIN_REGRESSION_ROWS) return null;
+
+  // Never extrapolate the regression past the drop the comparables themselves showed: a case whose
+  // hour-1 print sits outside their range (a degenerate or truncated print) would otherwise be
+  // projected onto a curve far above or below anything observed.
+  let minB = Infinity, maxB = -Infinity;
+  for (const row of rows) {
+    if (row.b < minB) minB = row.b;
+    if (row.b > maxB) maxB = row.b;
+  }
+  const targetDrop = Math.min(maxB, Math.max(minB, targetB));
 
   // Slope per hour, then smoothed over five hours so one noisy fit cannot swing a row.
   const slope = new Map<number, number>();
@@ -308,7 +322,7 @@ function levelModel(samples: Sample[], targetTrail: number[], p1: number): Map<n
     const usable = rows.filter((row) => row.r.has(hour));
     for (const row of usable) { sw += row.w; intercept += row.w * (row.r.get(hour)! - b * row.b); }
     intercept /= sw;
-    const predicted = intercept + b * targetB;
+    const predicted = intercept + b * targetDrop;
     const residuals = usable.map((row) => row.r.get(hour)! - (intercept + b * row.b));
     out.set(hour, TAU.map((tau) => targetPeak * Math.exp(predicted + quantile(residuals, tau) * B_SPREAD_SCALE)));
   }
@@ -337,7 +351,7 @@ function forecastCase(caseFile: CaseFile): Array<{ hour: number; q: number[] }> 
     if (samples.length === 0) {
       quantiles = Z.map((z) => p1 * Math.exp(FALLBACK_SHAPE[hour - 2] + z * 0.35));
     } else {
-      const shape = shapeModel(samples, p1, hour);
+      const shape = shapeModel(samples, hour);
       quantiles = Z.map((z) => p1 * Math.exp(shape.centre + z * shape.spread));
       const fromLevel = level?.get(hour);
       if (fromLevel !== undefined) {
