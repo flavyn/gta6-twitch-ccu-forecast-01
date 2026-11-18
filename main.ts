@@ -5,12 +5,20 @@
 // of hours 2..24. The score is the mean pinball loss on the log scale, so only the *shape* of the
 // curve (ratios to hour 1) and the *spread* around it matter; the absolute audience size cancels out.
 //
-// Method (the numbers behind it are in SPEC.md beside the kit, measured on the four practice
-// launches p00..p03): every comparable launch is turned into a 24-slot hour-of-day profile relative
-// to its own release day. For each hour h we collect r = ln(profile[h-1] / profile[0]) over the
-// comparables that have both slots, weight each comparable by recency and by how close its hour-1
-// level was to this case's, and take the weighted median as the centre. A weighted MAD around that
-// centre, scaled by 0.7, gives the log-scale spread that turns the centre into five quantiles.
+// Two models are built and averaged in log space, because they see different parts of the same fact.
+//
+//   A. the shape model. Every comparable launch becomes a 24-slot profile of mean viewers per hour
+//      of its own release day. For each hour h it contributes r = ln(profile[h-1] / profile[0]),
+//      weighted by recency and by how close its hour-1 level was to this case's. The weighted median
+//      of those r values is the centre; a weighted MAD around it, scaled by 0.7, is the spread.
+//
+//   B. the level model. Hour 1 is one noisy reading of how much of the world was already watching;
+//      the peak of the hours just before the release day is another. A launch whose hour 1 fell far
+//      below that peak had caught only part of the wave and tends to keep ramping, while one whose
+//      hour 1 already sat near the peak flattens. So for each comparable we regress its log level
+//      ln(viewers_h / pre-release peak) on ln(hour1 / pre-release peak), weight each comparable by
+//      how closely its pre-release trajectory matched this case's, and read the five quantiles off
+//      the regression residuals.
 //
 // Everything here is deterministic: the same case file always produces the same bytes, which the
 // grader requires of its two runs.
@@ -29,24 +37,29 @@ const TAU = [0.05, 0.25, 0.5, 0.75, 0.95];
 /** The standard normal's quantile at each of those levels. */
 const Z = [-1.645, -0.674, 0, 0.674, 1.645];
 
-/** Hours 2..24 are forecast; hour 1 is given. */
+const HOUR_MS = 3_600_000;
 const FIRST_HOUR = 2;
 const LAST_HOUR = 24;
-/** A viewer count never leaves (0, 1e9]. */
 const MAX_VIEWERS = 1e9;
 
-/** Reference year the recency weight counts back from, and its half-life in years. */
+/** Model A: the comparable-shape medians. */
 const REFERENCE_YEAR = 2026;
 const HALF_LIFE_YEARS = 2;
-/** How hard a comparable's hour-1 level is pulled away from this case's own. */
 const LEVEL_WEIGHT = 0.35;
-/** Multiplier and floor of the log-scale spread. */
 const SIGMA_SCALE = 0.7;
 const SIGMA_FLOOR = 0.12;
-/** A comparable needs at least this many viewers at hour 1 to be usable at all. */
 const MIN_HOUR1_VIEWERS = 200;
-/** ... and at least this many of the other 23 slots present. */
 const MIN_SLOTS_PRESENT = 20;
+
+/** Model B: the pre-release-peak regression. */
+const TRAIL_HOURS = 4;
+const BANDWIDTH = 1;
+const MIN_LEVEL_HOUR1 = 10_000;
+const B_SPREAD_SCALE = 0.9;
+const MIN_REGRESSION_ROWS = 8;
+
+/** How much of the answer comes from model B, in log space. */
+const BLEND_WEIGHT = 0.5;
 
 /**
  * Median log-ratio shape, ln(viewers_h / viewers_1) for h = 2..24, measured over the comparable
@@ -75,18 +88,28 @@ interface CaseFile {
   levels?: number[];
   known: Array<{ hour: number; viewers: number }>;
   forecast?: Array<{ hour: number }>;
+  history_hourly?: Point[] | null;
   comparables?: Comparable[] | null;
 }
 
-/** One comparable reduced to what the model needs: a level per hour of its release day. */
+/** A comparable reduced to what the models need. */
 interface Sample {
-  /** Viewers at each hour of the day; null where the source had no point for that hour. */
+  /** Mean viewers at each hour of its release day, null where the source had no point. */
   profile: Array<number | null>;
-  /** The weight this sample carries in the medians. */
+  /** Peak viewers across the hours just before its release day. */
+  prePeak: number;
+  /** log(viewers at the hours before the release day), oldest first. */
+  trail: number[];
+  /** Model A's weight. */
   weight: number;
 }
 
-/** Weighted median of (value, weight) pairs; the first value whose weight reaches half the total. */
+/** log of a positive finite number, or null. */
+function logOf(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.log(value) : null;
+}
+
+/** Weighted median: the first value whose running weight reaches half the total. */
 function weightedMedian(pairs: Array<[number, number]>): number {
   const sorted = [...pairs].sort((a, b) => a[0] - b[0]);
   let total = 0;
@@ -99,36 +122,51 @@ function weightedMedian(pairs: Array<[number, number]>): number {
   return sorted[sorted.length - 1][0];
 }
 
-/** Weighted median absolute deviation around a already-computed weighted median. */
+/** Weighted median absolute deviation around a weighted median. */
 function weightedMad(pairs: Array<[number, number]>, centre: number): number {
   return weightedMedian(pairs.map(([value, w]) => [Math.abs(value - centre), w]));
 }
 
-/** The hour of the release day a timestamp falls in, as an index 0..23. */
-function slotOf(timestamp: string, dayStart: number): number {
+/** Linear-interpolated quantile of an unsorted list (type 7). */
+function quantile(values: number[], p: number): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  if (sorted.length === 0) return 0;
+  if (sorted.length === 1) return sorted[0];
+  const x = (sorted.length - 1) * p;
+  const lo = Math.floor(x);
+  const frac = x - lo;
+  return lo + 1 < sorted.length ? sorted[lo] + frac * (sorted[lo + 1] - sorted[lo]) : sorted[sorted.length - 1];
+}
+
+/** Hour index of a timestamp relative to a release day, or -1 when unparsable. */
+function hourIndex(timestamp: string, dayStartMs: number): number {
   const t = Date.parse(timestamp);
-  if (!Number.isFinite(t)) return -1;
-  return Math.floor((t - dayStart) / 3_600_000);
+  return Number.isFinite(t) ? Math.floor((t - dayStartMs) / HOUR_MS) : -1;
 }
 
 /**
- * Reduce one comparable to a 24-slot profile of mean viewers per hour of its release day, plus the
- * weight it should carry when this case's hour-1 print and its own are compared.
+ * Reduce one comparable to its 24-slot day profile, its pre-release peak and trail, and the weight
+ * model A should give it.
  */
-function toSample(comp: Comparable, dayStart: number, p1: number): Sample | null {
+function toSample(comp: Comparable, p1: number): Sample | null {
   const start = Date.parse(comp.day_start);
   const points = comp.hourly;
   if (!Number.isFinite(start) || !Array.isArray(points)) return null;
 
   const sums = new Array<number>(24).fill(0);
   const counts = new Array<number>(24).fill(0);
+  const before = new Map<number, number>();
   for (const point of points) {
-    const slot = slotOf(point.from, start);
-    if (slot < 0 || slot > 23) continue;
+    const slot = hourIndex(point.from, start);
     const viewers = point.viewers;
+    if (!Number.isFinite(slot) || slot < -TRAIL_HOURS) continue;
     if (typeof viewers !== 'number' || !Number.isFinite(viewers) || viewers <= 0) continue;
-    sums[slot] += viewers;
-    counts[slot] += 1;
+    if (slot < 0) {
+      before.set(slot, viewers);
+    } else if (slot <= 23) {
+      sums[slot] += viewers;
+      counts[slot] += 1;
+    }
   }
 
   const profile: Array<number | null> = sums.map((sum, slot) => (counts[slot] > 0 ? sum / counts[slot] : null));
@@ -139,57 +177,178 @@ function toSample(comp: Comparable, dayStart: number, p1: number): Sample | null
   for (let slot = 1; slot < 24; slot++) if (profile[slot] !== null) present += 1;
   if (present < MIN_SLOTS_PRESENT) return null;
 
+  const trail: number[] = [];
+  for (let slot = -TRAIL_HOURS; slot <= -1; slot++) {
+    const value = before.get(slot);
+    if (value === undefined) return null;
+    trail.push(value);
+  }
+  if (trail.length !== TRAIL_HOURS) return null;
+
   const year = new Date(comp.day_start).getUTCFullYear();
   const recency = Number.isFinite(year) ? Math.exp(-(REFERENCE_YEAR - year) / HALF_LIFE_YEARS) : 1;
   const level = Math.exp(-LEVEL_WEIGHT * Math.abs(Math.log(hour1) - Math.log(p1)));
-  return { profile, weight: recency * level };
+  return { profile, prePeak: Math.max(...trail), trail, weight: recency * level };
+}
+
+/** Model A: weighted median shape and weighted MAD spread. */
+function shapeModel(
+  samples: Sample[],
+  p1: number,
+  hour: number,
+): { centre: number; spread: number; rows: number } {
+  const slot = hour - 1;
+  const observations: Array<[number, number]> = [];
+  for (const sample of samples) {
+    const value = sample.profile[slot];
+    const base = sample.profile[0];
+    if (value === null || base === null) continue;
+    const logged = logOf(value);
+    const baseLog = logOf(base);
+    if (logged === null || baseLog === null) continue;
+    observations.push([logged - baseLog, sample.weight]);
+  }
+  if (observations.length < 3) {
+    return { centre: FALLBACK_SHAPE[hour - 2], spread: 0.35, rows: observations.length };
+  }
+  const centre = weightedMedian(observations);
+  const spread = Math.max(SIGMA_FLOOR, SIGMA_SCALE * 1.4826 * weightedMad(observations, centre));
+  return { centre, spread, rows: observations.length };
+}
+
+/** Standardise a log trajectory to zero mean and unit spread, so shapes compare. */
+function standardiseTrail(trail: number[]): number[] {
+  const logs = trail.map(Math.log);
+  const mean = logs.reduce((a, b) => a + b, 0) / logs.length;
+  const sd = Math.sqrt(logs.reduce((a, b) => a + (b - mean) ** 2, 0) / logs.length) || 1;
+  return logs.map((value) => (value - mean) / sd);
+}
+
+/** The hours just before the release day, as hourly means, or null when any is missing. */
+function preReleaseTrail(rows: Point[] | null | undefined, dayStartMs: number): number[] | null {
+  if (!Array.isArray(rows)) return null;
+  const byHour = new Map<number, number>();
+  for (const row of rows) {
+    const slot = hourIndex(row.from, dayStartMs);
+    const viewers = row.viewers;
+    if (viewers === null || typeof viewers !== 'number' || !Number.isFinite(viewers) || viewers <= 0) continue;
+    if (slot >= -TRAIL_HOURS && slot <= -1) byHour.set(slot, viewers);
+  }
+  const trail: number[] = [];
+  for (let slot = -TRAIL_HOURS; slot <= -1; slot++) {
+    const value = byHour.get(slot);
+    if (value === undefined) return null;
+    trail.push(value);
+  }
+  return trail;
+}
+
+/**
+ * Model B: for each hour, a weighted regression of ln(viewers / pre-release peak) on
+ * ln(hour-1 / pre-release peak) over the comparables, then quantiles from the residuals.
+ * Returns null when the case does not carry enough for it.
+ */
+function levelModel(samples: Sample[], targetTrail: number[], p1: number): Map<number, number[]> | null {
+  const targetZ = standardiseTrail(targetTrail);
+  const targetPeak = Math.max(...targetTrail);
+  if (!(targetPeak > 0)) return null;
+  const targetB = Math.log(p1 / targetPeak);
+
+  const rows: Array<{ b: number; r: Map<number, number>; w: number }> = [];
+  for (const sample of samples) {
+    const base = logOf(sample.profile[0]);
+    const peak = sample.prePeak;
+    if (base === null || !(peak > 0)) continue;
+    if (sample.profile[0] === null || sample.profile[0] < MIN_LEVEL_HOUR1) continue;
+
+    const r = new Map<number, number>();
+    for (let hour = FIRST_HOUR; hour <= LAST_HOUR; hour++) {
+      const value = logOf(sample.profile[hour - 1]);
+      if (value === null) continue;
+      r.set(hour, value - Math.log(peak));
+    }
+    if (r.size < 10) continue;
+
+    const z = standardiseTrail(sample.trail);
+    let distance = 0;
+    for (let i = 0; i < TRAIL_HOURS; i++) distance += (z[i] - targetZ[i]) ** 2;
+    rows.push({ b: base - Math.log(peak), r, w: Math.exp(-distance / (2 * BANDWIDTH)) });
+  }
+  if (rows.length < MIN_REGRESSION_ROWS) return null;
+
+  // Slope per hour, then smoothed over five hours so one noisy fit cannot swing a row.
+  const slope = new Map<number, number>();
+  for (let hour = FIRST_HOUR; hour <= LAST_HOUR; hour++) {
+    let sw = 0, meanB = 0, meanR = 0;
+    const usable = rows.filter((row) => row.r.has(hour));
+    if (usable.length < 3) { slope.set(hour, 0); continue; }
+    for (const row of usable) { sw += row.w; meanB += row.w * row.b; meanR += row.w * row.r.get(hour)!; }
+    meanB /= sw; meanR /= sw;
+    let sxy = 0, sxx = 0;
+    for (const row of usable) {
+      sxy += row.w * (row.b - meanB) * (row.r.get(hour)! - meanR);
+      sxx += row.w * (row.b - meanB) ** 2;
+    }
+    slope.set(hour, sxx > 1e-9 ? sxy / sxx : 0);
+  }
+  const smoothSlope = new Map<number, number>();
+  for (let hour = FIRST_HOUR; hour <= LAST_HOUR; hour++) {
+    let sum = 0, n = 0;
+    for (let other = hour - 2; other <= hour + 2; other++) {
+      const value = slope.get(other);
+      if (value !== undefined) { sum += value; n += 1; }
+    }
+    smoothSlope.set(hour, sum / n);
+  }
+
+  const out = new Map<number, number[]>();
+  for (let hour = FIRST_HOUR; hour <= LAST_HOUR; hour++) {
+    const b = smoothSlope.get(hour) ?? 0;
+    let sw = 0, intercept = 0;
+    const usable = rows.filter((row) => row.r.has(hour));
+    for (const row of usable) { sw += row.w; intercept += row.w * (row.r.get(hour)! - b * row.b); }
+    intercept /= sw;
+    const predicted = intercept + b * targetB;
+    const residuals = usable.map((row) => row.r.get(hour)! - (intercept + b * row.b));
+    out.set(hour, TAU.map((tau) => targetPeak * Math.exp(predicted + quantile(residuals, tau) * B_SPREAD_SCALE)));
+  }
+  return out;
 }
 
 /** Five viewer quantiles for every forecast hour of one case. */
 function forecastCase(caseFile: CaseFile): Array<{ hour: number; q: number[] }> {
   const known = caseFile.known.find((row) => row.hour === 1);
-  const p1 = Math.max(1, Number.isFinite(known?.viewers) ? Number(known?.viewers) : 1);
+  const p1 = Math.max(1, known && Number.isFinite(known.viewers) ? Number(known.viewers) : 1);
   const dayStart = Date.parse(caseFile.day_start);
 
-  // Every usable comparable, with its weight already folded in.
   const samples: Sample[] = [];
   for (const comp of caseFile.comparables ?? []) {
     if (!comp || typeof comp !== 'object') continue;
-    const sample = toSample(comp, dayStart, p1);
+    const sample = toSample(comp, p1);
     if (sample !== null) samples.push(sample);
   }
 
-  const hours: number[] = [];
-  for (let hour = FIRST_HOUR; hour <= LAST_HOUR; hour++) hours.push(hour);
-  if (samples.length === 0) {
-    return hours.map((hour) => ({
-      hour,
-      q: Z.map((z) => roundQuantile(p1 * Math.exp(FALLBACK_SHAPE[hour - 2] + z * 0.35))),
-    }));
-  }
+  const targetTrail = preReleaseTrail(caseFile.history_hourly, dayStart);
+  const level = targetTrail !== null && samples.length > 0 ? levelModel(samples, targetTrail, p1) : null;
 
-  return hours.map((hour) => {
-    const slot = hour - 1;
-    const observations: Array<[number, number]> = [];
-    for (const sample of samples) {
-      const value = sample.profile[slot];
-      const base = sample.profile[0];
-      if (value === null || base === null || value <= 0 || base <= 0) continue;
-      observations.push([Math.log(value / base), sample.weight]);
-    }
-
-    let centre: number;
-    let spread: number;
-    if (observations.length < 3) {
-      centre = FALLBACK_SHAPE[hour - 2];
-      spread = 0.35;
+  const answer: Array<{ hour: number; q: number[] }> = [];
+  for (let hour = FIRST_HOUR; hour <= LAST_HOUR; hour++) {
+    let quantiles: number[];
+    if (samples.length === 0) {
+      quantiles = Z.map((z) => p1 * Math.exp(FALLBACK_SHAPE[hour - 2] + z * 0.35));
     } else {
-      centre = weightedMedian(observations);
-      spread = Math.max(SIGMA_FLOOR, SIGMA_SCALE * 1.4826 * weightedMad(observations, centre));
+      const shape = shapeModel(samples, p1, hour);
+      quantiles = Z.map((z) => p1 * Math.exp(shape.centre + z * shape.spread));
+      const fromLevel = level?.get(hour);
+      if (fromLevel !== undefined) {
+        // Average the two models in log space, then come back to viewers.
+        quantiles = quantiles.map((value, index) =>
+          Math.exp((1 - BLEND_WEIGHT) * Math.log(value) + BLEND_WEIGHT * Math.log(fromLevel[index])));
+      }
     }
-    const q = Z.map((z) => roundQuantile(p1 * Math.exp(centre + z * spread)));
-    return { hour, q: tidy(q) };
-  });
+    answer.push({ hour, q: tidy(quantiles.map(roundQuantile)) });
+  }
+  return answer;
 }
 
 /** A quantile the answer may carry: finite, above 0, at most 1e9, rounded to two decimals. */
@@ -199,10 +358,9 @@ function roundQuantile(value: number): number {
   return Math.min(MAX_VIEWERS, Math.max(0.01, rounded));
 }
 
-/** Round five quantiles, then force them non-decreasing as the answer format requires. */
+/** Rounding can reorder a pair; the answer format wants the five non-decreasing. */
 function tidy(q: number[]): number[] {
-  const sorted = [...q].sort((a, b) => a - b);
-  return sorted;
+  return [...q].sort((a, b) => a - b);
 }
 
 mkdirSync(OUTPUT_DIR, { recursive: true });
